@@ -1,33 +1,25 @@
 import cv2
 import numpy as np
+import scipy.ndimage as ndimage
 
 def generate_noise_map(shape, scale=100.0, octaves=8, persistence=0.5, lacunarity=2.2):
-    """
-    Generates a horizontally seamless fractal noise map with smoother transitions.
-    """
     noise = np.zeros(shape, dtype=np.float32)
     amplitude = 1.0
     frequency = 1.0
     
     for i in range(octaves):
-        # Calculate grid size for this octave
         w_grid = int(max(4, shape[1] * frequency / scale))
         h_grid = int(max(4, shape[0] * frequency / scale))
         
-        # Generate random grid
         grid = np.random.normal(0, 1, (h_grid, w_grid)).astype(np.float32)
-        
-        # Pad for seamless horizontal wrapping
         pad = 3
         grid_padded = np.pad(grid, ((pad, pad), (pad, pad)), mode='wrap')
         
-        # Resize to full resolution with cubic interpolation for smoothness
         layer = cv2.resize(grid_padded, 
                            (int(shape[1] * (w_grid + 2*pad) / w_grid), 
                             int(shape[0] * (h_grid + 2*pad) / h_grid)), 
                            interpolation=cv2.INTER_CUBIC)
         
-        # Extract the middle part correctly
         start_y = int(pad * shape[0] / h_grid)
         start_x = int(pad * shape[1] / w_grid)
         noise += layer[start_y:start_y + shape[0], start_x:start_x + shape[1]] * amplitude
@@ -35,13 +27,92 @@ def generate_noise_map(shape, scale=100.0, octaves=8, persistence=0.5, lacunarit
         amplitude *= persistence
         frequency *= lacunarity
         
-    return (noise - noise.min()) / (noise.max() - noise.min())
+    return (noise - noise.min()) / (noise.max() - noise.min() + 1e-8)
+
+def simulate_climate(height_norm, is_land, global_temp=0.5, global_moisture=0.5):
+    height, width = height_norm.shape
+    
+    # 1. Temperature: based on latitude and elevation
+    y_indices = np.linspace(0, 1, height)[:, None]
+    lat_factor = 1.0 - np.abs(y_indices - 0.5) * 2  # 1 at equator, 0 at poles
+    
+    base_temp = lat_factor * (0.5 + global_temp * 0.5)
+    # Elevation cooling
+    temp_map = base_temp - (height_norm * 0.6)
+    temp_map = np.clip(temp_map, 0, 1)
+    
+    # 2. Moisture & Prevailing Winds (Rain Shadows)
+    # Simplified wind: West to East in temperate zones, East to West in tropics
+    wind_x = np.where((lat_factor > 0.3) & (lat_factor < 0.7), 1.0, -1.0)
+    
+    moisture_map = np.full((height, width), global_moisture, dtype=np.float32)
+    moisture_map[~is_land] = 1.0 # Oceans are full moisture
+    
+    # Simple Rain Shadow simulation (sweep horizontally)
+    print("Simulating rain shadows...")
+    for y in range(height):
+        current_moisture = 1.0
+        # Determine sweep direction based on wind
+        xs = range(width) if wind_x[y, 0] > 0 else range(width-1, -1, -1)
+        for x in xs:
+            if not is_land[y, x]:
+                current_moisture = 1.0 # recharge over ocean
+            else:
+                # lose moisture based on elevation change (orographic effect)
+                elev = height_norm[y, x]
+                if x > 0 and x < width-1:
+                    prev_elev = height_norm[y, x-1] if wind_x[y, 0] > 0 else height_norm[y, x+1]
+                    if elev > prev_elev:
+                        # Dropping rain on windward side
+                        moisture_map[y, x] = min(1.0, current_moisture + 0.2)
+                        current_moisture *= 0.8 # Lose moisture
+                    else:
+                        # Leeward side (rain shadow)
+                        moisture_map[y, x] = current_moisture
+                        current_moisture *= 0.99 # Slow evaporation
+                else:
+                    moisture_map[y, x] = current_moisture
+                    
+    # Smooth the maps to remove artifacts
+    temp_map = ndimage.gaussian_filter(temp_map, sigma=2)
+    moisture_map = ndimage.gaussian_filter(moisture_map, sigma=2)
+    
+    return temp_map, moisture_map
+
+def whittaker_biome_color(t, m):
+    # Colors (R, G, B)
+    TROPICAL_RAINFOREST = [34, 139, 34]
+    TROPICAL_SEASONAL_FOREST = [107, 142, 35]
+    SAVANNA = [189, 183, 107]
+    SUBTROPICAL_DESERT = [210, 180, 140]
+    TEMPERATE_RAINFOREST = [46, 139, 87]
+    TEMPERATE_DECIDUOUS_FOREST = [0, 100, 0]
+    WOODLAND = [143, 188, 143]
+    TEMPERATE_DESERT = [244, 164, 96]
+    TAIGA = [85, 107, 47]
+    TUNDRA = [176, 224, 230]
+    ICE = [240, 248, 255]
+
+    # Map T [0..1] and M [0..1]
+    if t < 0.2:
+        return ICE if m < 0.5 else TUNDRA
+    elif t < 0.4:
+        return TUNDRA if m < 0.3 else TAIGA
+    elif t < 0.7:
+        if m < 0.2: return TEMPERATE_DESERT
+        if m < 0.4: return WOODLAND
+        if m < 0.7: return TEMPERATE_DECIDUOUS_FOREST
+        return TEMPERATE_RAINFOREST
+    else:
+        if m < 0.2: return SUBTROPICAL_DESERT
+        if m < 0.4: return SAVANNA
+        if m < 0.7: return TROPICAL_SEASONAL_FOREST
+        return TROPICAL_RAINFOREST
 
 def color_lerp_multi(val, stops, colors):
-    """Linearly interpolates colors based on value stops for arrays of values."""
     val = np.asarray(val)
     out = np.zeros((val.shape[0], 3), dtype=np.float32)
-    for i in range(3): # R, G, B
+    for i in range(3):
         out[:, i] = np.interp(val, stops, [c[i] for c in colors])
     return out
 
@@ -56,90 +127,42 @@ def create_surface_texture(heightmap_path, mask_path='wp1_fractal_mask.png', out
     height, width = h_norm.shape
     del h16
 
-    # Normalize land and ocean separately
-    if np.any(is_land):
-        land_vals = h_norm[is_land]
-        h_land_norm = (land_vals - land_vals.min()) / (max(1e-6, land_vals.max() - land_vals.min()))
-    else:
-        h_land_norm = np.array([], dtype=np.float32)
+    print("Simulating Climate...")
+    temp_map, moisture_map = simulate_climate(h_norm, is_land, global_temp=temperature, global_moisture=moisture)
 
-    if np.any(~is_land):
-        ocean_vals = h_norm[~is_land]
-        h_ocean_norm = (ocean_vals.max() - ocean_vals) / (max(1e-6, ocean_vals.max() - ocean_vals.min()))
-    else:
-        h_ocean_norm = np.array([], dtype=np.float32)
-    
-    # --- RELIEF MAP ---
-    print("Generating Relief Map...")
-    relief_land_stops = [0.0, 0.2, 0.5, 0.8, 1.0]
-    relief_land_colors = [[34, 139, 34], [154, 205, 50], [222, 184, 135], [139, 69, 19], [255, 250, 250]]
-    relief_ocean_stops = [0.0, 1.0]
-    relief_ocean_colors = [[50, 100, 200], [10, 30, 80]]
-
-    relief_img = np.zeros((height, width, 3), dtype=np.uint8)
-    if np.any(is_land):
-        relief_img[is_land] = color_lerp_multi(h_land_norm, relief_land_stops, relief_land_colors)
-    if np.any(~is_land):
-        relief_img[~is_land] = color_lerp_multi(h_ocean_norm, relief_ocean_stops, relief_ocean_colors)
-    
-    # --- BIOME MAP ---
     print("Generating Biome Map...")
     biome_img = np.zeros((height, width, 3), dtype=np.uint8)
     
-    if np.any(is_land):
-        # Calculate latitude factor only for land pixels to save memory
-        row_indices = np.where(is_land)[0]
-        lat_factor_land = np.abs((row_indices.astype(np.float32) / (height - 1)) - 0.5) * 2
-        
-        # 1. Base logic: Forest/Mountain base
-        # Shift forest to mountain transition based on moisture
-        forest_threshold = 0.4 + (moisture * 0.4)
-        land_colors = color_lerp_multi(h_land_norm, [0, forest_threshold, 1.0], [[34, 139, 34], [100, 100, 100], [255, 255, 255]])
-        
-        # 2. Polar Ice Caps (Linear blend)
-        # Shift ice cap size based on temperature
-        ice_threshold = 0.6 + (temperature * 0.3)
-        ice_mask = lat_factor_land > ice_threshold
-        if np.any(ice_mask):
-            alpha = (lat_factor_land[ice_mask] - ice_threshold) / (1.0 - ice_threshold)
-            ice_color = [240, 248, 255]
-            for i in range(3):
-                land_colors[ice_mask, i] = (1 - alpha) * land_colors[ice_mask, i] + alpha * ice_color[i]
-        
-        # 3. Equatorial Deserts (Low lat, Low height)
-        # Desert size inversely related to moisture
-        desert_intensity = (1.5 - moisture)
-        desert_weight = np.clip((1.0 - lat_factor_land) * (1.0 - h_land_norm) - (0.2 + moisture * 0.3), 0, 1) * desert_intensity
-        desert_weight = np.clip(desert_weight, 0, 1)
-        desert_color = [210, 180, 140]
-        for i in range(3):
-            land_colors[:, i] = (1 - desert_weight) * land_colors[:, i] + desert_weight * desert_color[i]
-
-        biome_img[is_land] = land_colors
+    # Vectorized Whittaker Biome Application
+    for y in range(height):
+        for x in range(width):
+            if is_land[y, x]:
+                biome_img[y, x] = whittaker_biome_color(temp_map[y, x], moisture_map[y, x])
     
+    relief_ocean_stops = [0.0, 1.0]
+    relief_ocean_colors = [[50, 100, 200], [10, 30, 80]]
     if np.any(~is_land):
-        biome_img[~is_land] = relief_img[~is_land]
-    
-    # --- Detail Noise ---
+        ocean_vals = h_norm[~is_land]
+        h_ocean_norm = (ocean_vals.max() - ocean_vals) / (max(1e-6, ocean_vals.max() - ocean_vals.min()))
+        biome_img[~is_land] = color_lerp_multi(h_ocean_norm, relief_ocean_stops, relief_ocean_colors)
+
     print("Generating detail noise...")
-    # Global noise for base texture
     noise_layer = generate_noise_map((height, width), scale=20.0, octaves=6)
-    
-    # Secondary high-detail fractal noise for ocean depth
     ocean_noise = generate_noise_map((height, width), scale=50.0, octaves=8, persistence=0.6)
     
-    # Blend noise layers
     detail_noise = (0.8 + 0.4 * noise_layer)
     if np.any(~is_land):
         detail_noise[~is_land] *= (0.9 + 0.2 * ocean_noise[~is_land])
     detail_noise = detail_noise[:, :, np.newaxis]
     
-    final_relief = np.clip(relief_img * detail_noise, 0, 255).astype(np.uint8)
-    cv2.imwrite(f'{output_prefix}_relief_map.png', cv2.cvtColor(final_relief, cv2.COLOR_RGB2BGR))
-    
     final_biome = np.clip(biome_img * detail_noise, 0, 255).astype(np.uint8)
     cv2.imwrite(f'{output_prefix}_biome_map.png', cv2.cvtColor(final_biome, cv2.COLOR_RGB2BGR))
     cv2.imwrite(f'{output_prefix}_surface_texture.png', cv2.cvtColor(final_biome, cv2.COLOR_RGB2BGR))
+    
+    # Export temp and moisture maps for other systems (like vegetation)
+    cv2.imwrite(f'{output_prefix}_temperature_map.png', (temp_map * 255).astype(np.uint8))
+    cv2.imwrite(f'{output_prefix}_moisture_map.png', (moisture_map * 255).astype(np.uint8))
+    
     print(f"Saved outputs with prefix {output_prefix}.")
 
 if __name__ == "__main__":
