@@ -93,14 +93,27 @@ def clean_binary_mask(binary_map, min_area=500):
 
     return output_mask
 
-def process_sketch_to_fractal_mask(image_path, upscale_factor=4, noise_strength=15.0, min_land_area=800):
+def process_sketch_to_fractal_mask(image_path=None, upscale_factor=4, noise_strength=15.0, min_land_area=800):
     """
     Loads a sketch, converts it to a high-resolution fractal landmask.
     """
     print(f"Loading sketch from {image_path}...")
-    img_bgr = cv2.imread(image_path)
-    if img_bgr is None:
-        raise FileNotFoundError(f"Image not found at {image_path}")
+    
+    if image_path is None or not os.path.exists(image_path):
+        print("⚠️ No input sketch found. Generating random procedural coastline...")
+        # Create a 512x1024 random seed mask
+        h, w = 512, 1024
+        seed_mask = np.zeros((h, w), dtype=np.uint8)
+        # Place 3-5 random "blobs" of land
+        for _ in range(np.random.randint(3, 6)):
+            center = (np.random.randint(w//4, 3*w//4), np.random.randint(h//4, 3*h//4))
+            axes = (np.random.randint(w//10, w//4), np.random.randint(h//10, h//4))
+            cv2.ellipse(seed_mask, center, axes, np.random.randint(0, 360), 0, 360, 255, -1)
+        img_bgr = cv2.cvtColor(seed_mask, cv2.COLOR_GRAY2BGR)
+    else:
+        img_bgr = cv2.imread(image_path)
+        if img_bgr is None:
+            raise FileNotFoundError(f"Image not found at {image_path}")
 
     # Convert to HSV for better color-based separation
     hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
