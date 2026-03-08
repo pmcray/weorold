@@ -110,11 +110,11 @@ def simulate_hydraulic_erosion_gpu(height_map_16, num_particles=1000000, max_lif
         to_deposit = cp.where(delta_h > 0, cp.minimum(delta_h, sediment), (sediment - capacity) * deposit_speed)
         d_amount = to_deposit * active * deposit_mask
         
-        # Scatter add for atomic updates
-        cp.scatter_add(h_gpu, (y0, x0), d_amount * (1 - px) * (1 - py))
-        cp.scatter_add(h_gpu, (y0, x1), d_amount * px * (1 - py))
-        cp.scatter_add(h_gpu, (y1, x0), d_amount * (1 - px) * py)
-        cp.scatter_add(h_gpu, (y1, x1), d_amount * px * py)
+        # Use cp.add.at for atomic updates (equivalent to scatter_add)
+        cp.add.at(h_gpu, (y0, x0), d_amount * (1 - px) * (1 - py))
+        cp.add.at(h_gpu, (y0, x1), d_amount * px * (1 - py))
+        cp.add.at(h_gpu, (y1, x0), d_amount * (1 - px) * py)
+        cp.add.at(h_gpu, (y1, x1), d_amount * px * py)
         sediment[deposit_mask] -= to_deposit[deposit_mask]
         
         # Erosion
@@ -122,10 +122,10 @@ def simulate_hydraulic_erosion_gpu(height_map_16, num_particles=1000000, max_lif
         to_erode = cp.minimum((capacity - sediment) * erode_speed, -delta_h)
         e_amount = to_erode * erode_mask
         
-        cp.scatter_add(h_gpu, (y0, x0), -e_amount * (1 - px) * (1 - py))
-        cp.scatter_add(h_gpu, (y1, x1), -e_amount * px * py)
-        cp.scatter_add(h_gpu, (y0, x1), -e_amount * px * (1 - py))
-        cp.scatter_add(h_gpu, (y1, x0), -e_amount * (1 - px) * py)
+        cp.add.at(h_gpu, (y0, x0), -e_amount * (1 - px) * (1 - py))
+        cp.add.at(h_gpu, (y1, x1), -e_amount * px * py)
+        cp.add.at(h_gpu, (y0, x1), -e_amount * px * (1 - py))
+        cp.add.at(h_gpu, (y1, x0), -e_amount * (1 - px) * py)
         sediment[erode_mask] += to_erode[erode_mask]
         
         # Update speed and water
